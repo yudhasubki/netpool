@@ -216,7 +216,7 @@ func (netpool *Netpool) Actives() int {
 	return int(netpool.actives)
 }
 
-// For metrics purposes, one can call count to see total count of created
+// For metrics purposes, one can call counter to see total count of created
 // connections.
 func (netpool *Netpool) Counter() int64 {
 	return netpool.counter
