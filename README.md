@@ -17,49 +17,103 @@ Thread-safe operations for concurrent use
 go get github.com/yudhasubki/netpool
 ```
 
-## Usage	
+## Quick Start	
 
-Here's a simple example of how to use Netpool in your Go application:
+### Basic Usage
 ```go
 package main
 
 import (
-	"log"
-
-	"github.com/yudhasubki/netpool"
+    "log"
+    "net"
+    
+    "github.com/yudhasubki/netpool"
 )
 
 func main() {
-	netpool, err := netpool.New(func() (net.Conn, error) {
-		return net.Dial("tcp", "localhost:80")
-	}, 
-		netpool.WithMaxPool(10), // default 15
-		netpool.WithMinPool(5),  // default 5
+    // Create a pool
+    pool, err := netpool.New(func() (net.Conn, error) {
+		return net.Dial("tcp", "localhost:6379")
+	},
+		netpool.WithMinPool(5),
+		netpool.WithMaxPool(20),
 	)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	defer netpool.Close()
+	defer pool.Close()
 
-	conn, err := netpool.Get()
-	defer netpool.Put(conn, err)
+	conn, err := pool.Get()
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer conn.Close() // Automatically returns to pool
 
-	_, err = conn.Write([]byte("dial"))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Read the response from the connection
-	buffer := make([]byte, 4096)
-	_, err = conn.Read(buffer)
-	if err != nil {
-		log.Fatal(err)
-	}
+	conn.Write([]byte("PING\r\n"))
 }
 ```
+
+### With Idle Timeout
+```go
+pool, err := netpool.New(func() (net.Conn, error) {
+    return net.Dial("tcp", "localhost:6379")
+},
+    netpool.WithMinPool(2),
+    netpool.WithMaxPool(10),
+    netpool.WithMaxIdleTime(30*time.Second), 
+)
+```
+
+### Monitoring Pool Statistics
+```go
+stats := pool.Stats()
+fmt.Printf("Active: %d, Idle: %d, InUse: %d\n",
+	stats.Active, stats.Idle, stats.InUse)
+```
+
+## How it works
+### Connection Lifecycle
+- Creation: Connections are created using the provided factory function
+- Dial Hooks: Optional hooks run for connection initialization
+- Pool Storage: Idle connections are stored in a FIFO queue
+- Health Check: Connections are validated before being returned (if configured)
+- Idle Timeout: Unused connections are automatically cleaned up (if configured)
+- Auto-Return: Connections automatically return to pool on Close()
+
+### Auto-Return Connection Wrapper
+Connections returned by Get() are automatically wrapped in a pooledConn that returns the connection to the pool when Close() is called. This eliminates the need for manual Put() calls:
+```go
+// Old way (manual Put)
+conn, _ := pool.Get()
+defer pool.Put(conn, nil)
+
+// New way (auto-return)
+conn, _ := pool.Get()
+defer conn.Close() // Automatically returns to pool
+```
+
+If a connection encounters an error and should not be reused, use MarkUnusable():
+
+```go
+goconn, _ := pool.Get()
+
+_, err := conn.Write(data)
+if err != nil {
+    if pc, ok := conn.(interface{ MarkUnusable() error }); ok {
+        pc.MarkUnusable() // Connection won't be returned to pool
+    }
+    return err
+}
+
+conn.Close() // Normal return to pool
+```
+
+### Thread Safety
+netpool uses fine-grained locking to minimize contention:
+
+Pool operations are protected by a mutex
+Condition variables handle blocking when pool is exhausted
+Connection health checks run without holding the main lock
 
 ## Contributing
 Contributions are welcome! If you find a bug or have a suggestion for improvement, please open an issue or submit a pull request. Make sure to follow the existing coding style and write tests for any new functionality.
