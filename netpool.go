@@ -192,7 +192,39 @@ func New(fn netpoolFunc, opts ...Opt) (*Netpool, error) {
 }
 
 func (netpool *Netpool) createConnection() (net.Conn, error) {
-	conn, err := netpool.fn()
+	var conn net.Conn
+	var err error
+
+	// If DialTimeout is set, wrap the dial in a timeout
+	if netpool.config.DialTimeout > 0 {
+		type dialResult struct {
+			conn net.Conn
+			err  error
+		}
+		result := make(chan dialResult, 1)
+
+		go func() {
+			c, e := netpool.fn()
+			result <- dialResult{conn: c, err: e}
+		}()
+
+		select {
+		case r := <-result:
+			conn, err = r.conn, r.err
+		case <-time.After(netpool.config.DialTimeout):
+			// Dial timed out - if dial eventually succeeds, connection will leak
+			// To prevent this, we spawn a cleanup goroutine
+			go func() {
+				if r := <-result; r.conn != nil {
+					r.conn.Close()
+				}
+			}()
+			return nil, ErrDialTimeout
+		}
+	} else {
+		conn, err = netpool.fn()
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -259,20 +291,15 @@ func (netpool *Netpool) getWithContext(ctx context.Context) (net.Conn, error) {
 			return c, nil
 		}
 
-		done := make(chan struct{})
-
-		go func() {
-			select {
-			case <-ctx.Done():
-				netpool.mu.Lock()
-				netpool.cond.Broadcast()
-				netpool.mu.Unlock()
-			case <-done:
-			}
-		}()
+		// Use context.AfterFunc for cleaner context cancellation handling (Go 1.21+)
+		stop := context.AfterFunc(ctx, func() {
+			netpool.mu.Lock()
+			netpool.cond.Broadcast()
+			netpool.mu.Unlock()
+		})
 
 		netpool.cond.Wait()
-		close(done)
+		stop()
 	}
 }
 

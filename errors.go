@@ -14,4 +14,7 @@ var (
 
 	// ErrConnReturned is returned when connection already returned
 	ErrConnReturned = errors.New("connection already returned")
+
+	// ErrDialTimeout is returned when dial operation exceeds the configured timeout
+	ErrDialTimeout = errors.New("netpool: dial timeout exceeded")
 )

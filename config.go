@@ -40,6 +40,14 @@ type Config struct {
 	//
 	// If zero, a sensible default is chosen based on MaxIdleTime.
 	MaintainerInterval time.Duration
+
+	// DialTimeout is the maximum duration allowed for creating a new connection.
+	//
+	// If the dial operation takes longer than this duration, it will be
+	// canceled and an error will be returned.
+	//
+	// A zero value means no timeout (dial may block indefinitely).
+	DialTimeout time.Duration
 }
 
 // Opt represents a functional option used to configure a Netpool.
@@ -90,5 +98,15 @@ func WithMaxIdleTime(d time.Duration) Opt {
 func WithMaintainerInterval(d time.Duration) Opt {
 	return func(c *Config) {
 		c.MaintainerInterval = d
+	}
+}
+
+// WithDialTimeout sets the maximum duration for creating new connections.
+//
+// If a dial operation exceeds this timeout, it fails with a timeout error.
+// A zero value disables the timeout.
+func WithDialTimeout(d time.Duration) Opt {
+	return func(c *Config) {
+		c.DialTimeout = d
 	}
 }
