@@ -57,8 +57,8 @@ func TestNewConnection(t *testing.T) {
 	}
 
 	stats := pool.Stats()
-	if stats.TotalCreated != 3 {
-		t.Errorf("expected 3 total connections, got %d", stats.TotalCreated)
+	if stats.Active != 3 {
+		t.Errorf("expected 3 total connections, got %d", stats.Active)
 	}
 }
 
@@ -79,6 +79,7 @@ func TestGetConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
+	defer conn.Close() // Auto-return to pool
 
 	testMsg := []byte("hello")
 	_, err = conn.Write(testMsg)
@@ -97,10 +98,14 @@ func TestGetConnection(t *testing.T) {
 		t.Errorf("expected %s, got %s", testMsg, buf[:n])
 	}
 
-	pool.Put(conn, nil)
+	// Connection auto-returns on Close()
+	conn.Close()
+
+	// Give a moment for Close() to complete
+	time.Sleep(10 * time.Millisecond)
 
 	if pool.Len() != 2 {
-		t.Errorf("expected 2 idle connections after Put, got %d", pool.Len())
+		t.Errorf("expected 2 idle connections after Close, got %d", pool.Len())
 	}
 }
 
@@ -118,22 +123,21 @@ func TestGetCreatesNewConnection(t *testing.T) {
 	defer pool.Close()
 
 	conn1, _ := pool.Get()
+	defer conn1.Close()
 
 	conn2, err := pool.Get()
 	if err != nil {
 		t.Fatalf("expected new connection, got error: %v", err)
 	}
+	defer conn2.Close()
 
 	stats := pool.Stats()
-	if stats.TotalCreated != 2 {
-		t.Errorf("expected 2 total connections, got %d", stats.TotalCreated)
+	if stats.Active != 2 {
+		t.Errorf("expected 2 total connections, got %d", stats.Active)
 	}
 	if stats.InUse != 2 {
 		t.Errorf("expected 2 in-use connections, got %d", stats.InUse)
 	}
-
-	pool.Put(conn1, nil)
-	pool.Put(conn2, nil)
 }
 
 func TestPutWithConnectionError(t *testing.T) {
@@ -152,12 +156,24 @@ func TestPutWithConnectionError(t *testing.T) {
 	conn, _ := pool.Get()
 	initialStats := pool.Stats()
 
-	pool.Put(conn, errors.New("connection broken"))
+	// Use MarkUnusable for better error handling
+	if pc, ok := conn.(interface{ MarkUnusable() error }); ok {
+		err := pc.MarkUnusable()
+		if err != nil {
+			t.Fatalf("MarkUnusable failed: %v", err)
+		}
+	} else {
+		t.Fatal("connection doesn't support MarkUnusable")
+	}
+
+	// Give time for cleanup
+	time.Sleep(50 * time.Millisecond)
 
 	finalStats := pool.Stats()
 
-	if finalStats.TotalCreated != initialStats.TotalCreated-1 {
-		t.Errorf("expected TotalCreated to decrease")
+	if finalStats.Active != initialStats.Active-1 {
+		t.Errorf("expected TotalCreated to decrease from %d to %d, got %d",
+			initialStats.Active, initialStats.Active-1, finalStats.Active)
 	}
 }
 
@@ -191,7 +207,7 @@ func TestGetBlocksAtMaxPool(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	pool.Put(conn1, nil)
+	conn1.Close() // Auto-return to pool
 
 	select {
 	case <-blocked:
@@ -202,8 +218,8 @@ func TestGetBlocksAtMaxPool(t *testing.T) {
 		t.Fatal("Get() didn't unblock")
 	}
 
-	pool.Put(conn2, nil)
-	pool.Put(conn3, nil)
+	conn2.Close()
+	conn3.Close()
 }
 
 func TestConcurrentGetPutConnections(t *testing.T) {
@@ -223,7 +239,7 @@ func TestConcurrentGetPutConnections(t *testing.T) {
 	goroutines := 20
 	iterations := 50
 
-	errors := make(chan error, goroutines*iterations)
+	errorsChan := make(chan error, goroutines*iterations)
 
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
@@ -232,7 +248,7 @@ func TestConcurrentGetPutConnections(t *testing.T) {
 			for j := 0; j < iterations; j++ {
 				conn, err := pool.Get()
 				if err != nil {
-					errors <- err
+					errorsChan <- err
 					continue
 				}
 
@@ -240,8 +256,13 @@ func TestConcurrentGetPutConnections(t *testing.T) {
 				msg := []byte("test")
 				_, err = conn.Write(msg)
 				if err != nil {
-					pool.Put(conn, err)
-					errors <- err
+					// Mark unusable on error
+					if pc, ok := conn.(interface{ MarkUnusable() error }); ok {
+						pc.MarkUnusable()
+					} else {
+						conn.Close()
+					}
+					errorsChan <- err
 					continue
 				}
 
@@ -249,16 +270,25 @@ func TestConcurrentGetPutConnections(t *testing.T) {
 				conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 				_, err = conn.Read(buf)
 
-				pool.Put(conn, err)
+				if err != nil {
+					// Mark unusable on error
+					if pc, ok := conn.(interface{ MarkUnusable() error }); ok {
+						pc.MarkUnusable()
+					} else {
+						conn.Close()
+					}
+				} else {
+					conn.Close() // Normal return to pool
+				}
 			}
 		}(i)
 	}
 
 	wg.Wait()
-	close(errors)
+	close(errorsChan)
 
 	errorCount := 0
-	for err := range errors {
+	for err := range errorsChan {
 		t.Logf("error during test: %v", err)
 		errorCount++
 	}
@@ -269,10 +299,10 @@ func TestConcurrentGetPutConnections(t *testing.T) {
 
 	stats := pool.Stats()
 	t.Logf("Final stats - Total: %d, Idle: %d, InUse: %d",
-		stats.TotalCreated, stats.Idle, stats.InUse)
+		stats.Active, stats.Idle, stats.InUse)
 }
 
-func TestClose_Connections(t *testing.T) {
+func TestCloseConnections(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
@@ -296,6 +326,7 @@ func TestClose_Connections(t *testing.T) {
 		t.Errorf("expected 0 idle connections after Close, got %d", stats.Idle)
 	}
 
+	// Connections should be closed by pool.Close()
 	_, err = conns[0].Write([]byte("test"))
 	if err == nil {
 		t.Error("expected error writing to closed connection")
@@ -322,16 +353,17 @@ func TestDialHooksConnection(t *testing.T) {
 	defer listener.Close()
 
 	hookCalled := 0
-	hook := func(conn net.Conn) error {
+	hook := func(conn net.Conn) error { // Updated signature: any instead of net.Conn
 		hookCalled++
+		c := conn.(net.Conn)
 		// Test the connection
-		_, err := conn.Write([]byte("hook test"))
+		_, err := c.Write([]byte("hook test"))
 		return err
 	}
 
 	pool, err := New(func() (net.Conn, error) {
 		return net.Dial("tcp", addr)
-	}, WithMinPool(2), WithDialHooks(hook))
+	}, WithMinPool(2), WithDialHooks(hook)) // Pass as slice
 
 	if err != nil {
 		t.Fatalf("failed to create pool: %v", err)
@@ -355,12 +387,12 @@ func TestDialHooksConnection(t *testing.T) {
 		t.Errorf("expected hook to be called 3 times total (created new conn), got %d", hookCalled)
 	}
 
-	pool.Put(conn1, nil)
-	pool.Put(conn2, nil)
-	pool.Put(conn3, nil)
+	conn1.Close()
+	conn2.Close()
+	conn3.Close()
 }
 
-func TestStatsAccuracy(t *testing.T) {
+func TestPooledConnAutoReturn(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
@@ -373,36 +405,341 @@ func TestStatsAccuracy(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// Initial state
+	initialStats := pool.Stats()
+
+	// Get connection
+	conn, err := pool.Get()
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	afterGetStats := pool.Stats()
+	if afterGetStats.InUse != initialStats.InUse+1 {
+		t.Errorf("expected InUse to increase by 1")
+	}
+
+	err = conn.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	afterCloseStats := pool.Stats()
+	if afterCloseStats.InUse != initialStats.InUse {
+		t.Errorf("expected InUse to return to original after Close")
+	}
+
+	_, err = conn.Write([]byte("test"))
+	if err == nil {
+		t.Error("expected error writing to closed connection")
+	}
+}
+
+func TestPooledConnMarkUnusable(t *testing.T) {
+	listener, addr := createTestServer(t)
+	defer listener.Close()
+
+	pool, err := New(func() (net.Conn, error) {
+		return net.Dial("tcp", addr)
+	}, WithMinPool(2), WithMaxPool(5))
+
+	if err != nil {
+		t.Fatalf("failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	initialStats := pool.Stats()
+
+	conn, _ := pool.Get()
+
+	if pc, ok := conn.(interface{ MarkUnusable() error }); ok {
+		err = pc.MarkUnusable()
+		if err != nil {
+			t.Fatalf("MarkUnusable failed: %v", err)
+		}
+	} else {
+		t.Fatal("connection doesn't implement MarkUnusable")
+	}
+
+	finalStats := pool.Stats()
+	if finalStats.Active != initialStats.Active-1 {
+		t.Errorf("expected TotalCreated to decrease by 1 after MarkUnusable")
+	}
+}
+
+func TestIdleTimeoutWithPoolGrowthAndShrink(t *testing.T) {
+	listener, addr := createTestServer(t)
+	defer listener.Close()
+
+	pool, err := New(func() (net.Conn, error) {
+		return net.Dial("tcp", addr)
+	},
+		WithMinPool(2),
+		WithMaxPool(10),
+		WithMaxIdleTime(2*time.Second), // 2 second idle timeout
+	)
+
+	if err != nil {
+		t.Fatalf("failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	t.Log("Phase 1: Initial state")
 	stats := pool.Stats()
-	if stats.TotalCreated != 2 || stats.Idle != 2 || stats.InUse != 0 {
-		t.Errorf("initial stats incorrect: %+v", stats)
+	if stats.Active != 2 {
+		t.Errorf("expected 2 initial connections, got %d", stats.Active)
 	}
+	t.Logf("Initial - Total: %d, Idle: %d, InUse: %d", stats.Active, stats.Idle, stats.InUse)
 
-	conn1, _ := pool.Get()
-	conn2, _ := pool.Get()
+	// Phase 2: Grow pool to max
+	t.Log("Phase 2: Growing pool to max capacity")
+	conns := make([]net.Conn, 10)
+	for i := 0; i < 10; i++ {
+		conns[i], err = pool.Get()
+		if err != nil {
+			t.Fatalf("failed to get connection %d: %v", i, err)
+		}
+	}
 
 	stats = pool.Stats()
-	if stats.TotalCreated != 2 || stats.Idle != 0 || stats.InUse != 2 {
-		t.Errorf("stats after Get incorrect: %+v", stats)
+	if stats.Active != 10 {
+		t.Errorf("expected 10 connections at max, got %d", stats.Active)
 	}
+	if stats.InUse != 10 {
+		t.Errorf("expected 10 in-use connections, got %d", stats.InUse)
+	}
+	t.Logf("At max capacity - Total: %d, Idle: %d, InUse: %d", stats.Active, stats.Idle, stats.InUse)
 
-	pool.Put(conn1, nil)
+	// Phase 3: Return all connections to pool
+	t.Log("Phase 3: Returning all connections to pool")
+	for i := 0; i < 10; i++ {
+		conns[i].Close()
+	}
+	time.Sleep(100 * time.Millisecond) // Wait for close to complete
 
 	stats = pool.Stats()
-	if stats.TotalCreated != 2 || stats.Idle != 1 || stats.InUse != 1 {
-		t.Errorf("stats after Put incorrect: %+v", stats)
+	if stats.Idle != 10 {
+		t.Errorf("expected 10 idle connections, got %d", stats.Idle)
 	}
+	if stats.InUse != 0 {
+		t.Errorf("expected 0 in-use connections, got %d", stats.InUse)
+	}
+	t.Logf("All returned - Total: %d, Idle: %d, InUse: %d", stats.Active, stats.Idle, stats.InUse)
 
-	conn3, _ := pool.Get()
-	conn4, _ := pool.Get()
+	// Phase 4: Wait for idle timeout to kick in (should clean up to MinPool)
+	t.Log("Phase 4: Waiting for idle timeout...")
+	time.Sleep(3 * time.Second) // Wait longer than MaxIdleTime
 
 	stats = pool.Stats()
-	if stats.TotalCreated != 3 || stats.Idle != 0 || stats.InUse != 3 {
-		t.Errorf("stats after creating new incorrect: %+v", stats)
+	t.Logf("After idle timeout - Total: %d, Idle: %d, InUse: %d", stats.Active, stats.Idle, stats.InUse)
+
+	// Should have cleaned up idle connections but kept at least MinPool
+	if stats.Active < 2 {
+		t.Errorf("pool went below MinPool: got %d, expected at least 2", stats.Active)
+	}
+	if stats.Active > 5 {
+		t.Errorf("idle reaper didn't clean up enough: got %d, expected <= 5", stats.Active)
 	}
 
-	pool.Put(conn2, nil)
-	pool.Put(conn3, nil)
-	pool.Put(conn4, nil)
+	// Phase 5: Verify pool still works after cleanup
+	t.Log("Phase 5: Verifying pool still works after cleanup")
+	testConn, err := pool.Get()
+	if err != nil {
+		t.Fatalf("pool not working after idle cleanup: %v", err)
+	}
+
+	// Use the connection
+	testMsg := []byte("test after cleanup")
+	_, err = testConn.Write(testMsg)
+	if err != nil {
+		t.Fatalf("connection not working after cleanup: %v", err)
+	}
+
+	buf := make([]byte, 1024)
+	testConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	n, err := testConn.Read(buf)
+	if err != nil {
+		t.Fatalf("read failed after cleanup: %v", err)
+	}
+
+	if string(buf[:n]) != string(testMsg) {
+		t.Errorf("echo failed: expected %s, got %s", testMsg, buf[:n])
+	}
+
+	testConn.Close()
+	t.Log("Phase 5: Pool still functional")
+
+	// Phase 6: Grow again and verify it works
+	t.Log("Phase 6: Growing pool again after cleanup")
+	newConns := make([]net.Conn, 5)
+	for i := 0; i < 5; i++ {
+		newConns[i], err = pool.Get()
+		if err != nil {
+			t.Fatalf("failed to get connection after cleanup: %v", err)
+		}
+	}
+
+	stats = pool.Stats()
+	t.Logf("After regrowth - Total: %d, Idle: %d, InUse: %d", stats.Active, stats.Idle, stats.InUse)
+
+	if stats.InUse < 5 {
+		t.Errorf("expected at least 5 in-use connections, got %d", stats.InUse)
+	}
+
+	// Cleanup
+	for i := 0; i < 5; i++ {
+		newConns[i].Close()
+	}
+
+	t.Log("Test completed successfully")
+}
+
+func TestRepeatedGrowthShrinkDoesNotLeak(t *testing.T) {
+	listener, addr := createTestServer(t)
+	defer listener.Close()
+
+	pool, err := New(
+		func() (net.Conn, error) {
+			return net.Dial("tcp", addr)
+		},
+		WithMinPool(2),
+		WithMaxPool(20),
+		WithMaxIdleTime(200*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	for i := 0; i < 10; i++ {
+		conns := make([]net.Conn, 20)
+		for j := 0; j < 20; j++ {
+			conns[j], _ = pool.Get()
+		}
+
+		for j := 0; j < 20; j++ {
+			conns[j].Close()
+		}
+
+		time.Sleep(400 * time.Millisecond)
+
+		stats := pool.Stats()
+		if stats.Active > 5 {
+			t.Fatalf("iteration %d: pool not shrinking properly: %+v", i, stats)
+		}
+	}
+}
+
+func TestIdleReaperWhileConcurrentGet(t *testing.T) {
+	listener, addr := createTestServer(t)
+	defer listener.Close()
+
+	pool, err := New(
+		func() (net.Conn, error) {
+			return net.Dial("tcp", addr)
+		},
+		WithMinPool(1),
+		WithMaxPool(5),
+		WithMaxIdleTime(200*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				conn, err := pool.Get()
+				if err == nil {
+					time.Sleep(10 * time.Millisecond)
+					conn.Close()
+				}
+			}
+		}
+	}()
+
+	time.Sleep(1 * time.Second) // let reaper & maintainer fight
+
+	close(stop)
+
+	stats := pool.Stats()
+	if stats.Active < 1 {
+		t.Fatalf("pool corrupted: %+v", stats)
+	}
+}
+
+func BenchmarkPoolGetPut(b *testing.B) {
+	listener, addr := createBenchmarkTestServer(b)
+	defer listener.Close()
+
+	pool, _ := New(func() (net.Conn, error) {
+		return net.Dial("tcp", addr)
+	}, WithMinPool(10), WithMaxPool(300))
+	defer pool.Close()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			conn, err := pool.Get()
+			if err != nil {
+				b.Fatal(err)
+			}
+			conn.Close()
+		}
+	})
+}
+
+func BenchmarkPoolConcurrent(b *testing.B) {
+	listener, addr := createBenchmarkTestServer(b)
+	defer listener.Close()
+
+	pool, _ := New(func() (net.Conn, error) {
+		return net.Dial("tcp", addr)
+	}, WithMinPool(10), WithMaxPool(300))
+	defer pool.Close()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			conn, err := pool.Get()
+			if err != nil {
+				b.Fatal(err)
+			}
+			conn.Write([]byte("test data"))
+			conn.Close()
+		}
+	})
+}
+
+func createBenchmarkTestServer(t testing.TB) (net.Listener, string) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					c.Write(buf[:n])
+				}
+			}(conn)
+		}
+	}()
+
+	return listener, listener.Addr().String()
 }
