@@ -1165,6 +1165,67 @@ func TestExtremeContention(t *testing.T) {
 	}
 }
 
+func TestDialTimeout(t *testing.T) {
+	slowDial := func() (net.Conn, error) {
+		time.Sleep(500 * time.Millisecond)
+		return net.Dial("tcp", "127.0.0.1:9999")
+	}
+
+	start := time.Now()
+	_, err := New(slowDial,
+		WithMinPool(1),
+		WithMaxPool(5),
+		WithDialTimeout(100*time.Millisecond),
+	)
+	elapsed := time.Since(start)
+
+	if err != ErrDialTimeout {
+		t.Errorf("expected ErrDialTimeout, got %v", err)
+	}
+
+	if elapsed >= 400*time.Millisecond {
+		t.Errorf("timeout took too long: %v, expected ~100ms", elapsed)
+	}
+	if elapsed < 50*time.Millisecond {
+		t.Errorf("timeout happened too quickly: %v", elapsed)
+	}
+
+	t.Logf("Dial timeout detected after %v", elapsed)
+}
+
+func TestDialTimeoutWithWorkingServer(t *testing.T) {
+	listener, addr := createTestServer(t)
+	defer listener.Close()
+
+	pool, err := New(func() (net.Conn, error) {
+		return net.Dial("tcp", addr)
+	},
+		WithMinPool(2),
+		WithMaxPool(5),
+		WithDialTimeout(5*time.Second),
+	)
+
+	if err != nil {
+		t.Fatalf("failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	conn, err := pool.Get()
+	if err != nil {
+		t.Fatalf("failed to get connection: %v", err)
+	}
+	defer conn.Close()
+
+	_, err = conn.Write([]byte("test"))
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	stats := pool.Stats()
+	t.Logf("Pool stats with DialTimeout: Active=%d, Idle=%d, InUse=%d",
+		stats.Active, stats.Idle, stats.InUse)
+}
+
 func BenchmarkPoolConcurrent(b *testing.B) {
 	listener, addr := createBenchmarkTestServer(b)
 	defer listener.Close()
