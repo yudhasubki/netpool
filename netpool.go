@@ -238,7 +238,6 @@ func (netpool *Netpool) getWithContext(ctx context.Context) (net.Conn, error) {
 			return nil, err
 		}
 
-		// If we have an idle conn, use it.
 		if netpool.connections.Len() > 0 {
 			entry := netpool.connections.Remove(netpool.connections.Front()).(*connEntry)
 			entry.lastUsed = time.Now()
@@ -246,13 +245,11 @@ func (netpool *Netpool) getWithContext(ctx context.Context) (net.Conn, error) {
 			return entry.conn, nil
 		}
 
-		// If we can create a new conn, do it.
 		if len(netpool.allConns) < int(netpool.config.MaxPool) {
 			c, err := netpool.createConnection()
 			if err != nil {
 				return nil, err
 			}
-
 			entry := &connEntry{
 				conn:     c,
 				lastUsed: time.Now(),
@@ -262,10 +259,20 @@ func (netpool *Netpool) getWithContext(ctx context.Context) (net.Conn, error) {
 			return c, nil
 		}
 
-		// Otherwise wait for a conn to be returned or pool closed.
-		// Note: sync.Cond can't be context-canceled without extra plumbing,
-		// but we re-check ctx.Err() on each wakeup.
+		done := make(chan struct{})
+
+		go func() {
+			select {
+			case <-ctx.Done():
+				netpool.mu.Lock()
+				netpool.cond.Broadcast()
+				netpool.mu.Unlock()
+			case <-done:
+			}
+		}()
+
 		netpool.cond.Wait()
+		close(done)
 	}
 }
 
