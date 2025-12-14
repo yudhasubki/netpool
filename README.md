@@ -95,17 +95,17 @@ defer conn.Close() // Automatically returns to pool
 If a connection encounters an error and should not be reused, use MarkUnusable():
 
 ```go
-goconn, _ := pool.Get()
+conn, _ := pool.Get()
 
 _, err := conn.Write(data)
 if err != nil {
-    if pc, ok := conn.(interface{ MarkUnusable() error }); ok {
-        pc.MarkUnusable() // Connection won't be returned to pool
-    }
-    return err
+	if pc, ok := conn.(interface{ MarkUnusable() error }); ok {
+		pc.MarkUnusable()
+	}
+	return err
 }
 
-conn.Close() // Normal return to pool
+conn.Close()
 ```
 
 ### Thread Safety
