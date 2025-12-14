@@ -2,8 +2,15 @@ package netpool
 
 import (
 	"net"
+	"sync"
 	"sync/atomic"
 )
+
+var pooledConnPool = sync.Pool{
+	New: func() any {
+		return new(pooledConn)
+	},
+}
 
 // pooledConn wraps a net.Conn and automatically returns it to the pool on Close()
 type pooledConn struct {
@@ -16,10 +23,12 @@ type pooledConn struct {
 }
 
 func newPooledConn(c net.Conn, p *Netpool) *pooledConn {
-	return &pooledConn{
-		Conn: c,
-		pool: p,
-	}
+	pc := pooledConnPool.Get().(*pooledConn)
+	pc.Conn = c
+	pc.pool = p
+	pc.returned.Store(false)
+	pc.lastErr.Store(nil)
+	return pc
 }
 
 func (pc *pooledConn) setErr(err error) {
@@ -36,11 +45,15 @@ func (pc *pooledConn) Close() error {
 	}
 
 	var err error
-	if p := pc.lastErr.Load(); p != nil {
-		err = *p
+	if v := pc.lastErr.Load(); v != nil {
+		err = *v
 	}
-
 	pc.pool.Put(pc.Conn, err)
+
+	pc.Conn = nil
+	pc.pool = nil
+	pooledConnPool.Put(pc)
+
 	return nil
 }
 

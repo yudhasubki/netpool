@@ -672,7 +672,7 @@ func TestIdleReaperWhileConcurrentGet(t *testing.T) {
 	}
 }
 
-func BenchmarkPoolGetPut(b *testing.B) {
+func BenchmarkPoolGet(b *testing.B) {
 	listener, addr := createBenchmarkTestServer(b)
 	defer listener.Close()
 
