@@ -136,7 +136,7 @@ func TestGetCreatesNewConnection(t *testing.T) {
 	pool.Put(conn2, nil)
 }
 
-func TestPut_WithConnectionError(t *testing.T) {
+func TestPutWithConnectionError(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
@@ -206,7 +206,7 @@ func TestGetBlocksAtMaxPool(t *testing.T) {
 	pool.Put(conn3, nil)
 }
 
-func TestConcurrentGetPut_Connections(t *testing.T) {
+func TestConcurrentGetPutConnections(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
@@ -317,7 +317,7 @@ func TestNewDialFailure(t *testing.T) {
 	}
 }
 
-func TestDialHooks_Connection(t *testing.T) {
+func TestDialHooksConnection(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
@@ -360,7 +360,7 @@ func TestDialHooks_Connection(t *testing.T) {
 	pool.Put(conn3, nil)
 }
 
-func TestStats_Accuracy(t *testing.T) {
+func TestStatsAccuracy(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 

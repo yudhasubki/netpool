@@ -1,0 +1,122 @@
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+
+filter-by-commitish: true
+commitish: main
+
+categories:
+  - title: 🚀 Features
+    labels:
+      - major
+      - feature
+
+  - title: 🐛 Bug Fixes
+    labels:
+      - fix
+
+  - title: 🧰 Maintenance
+    labels:
+      - chore
+      - cicd
+      - refactor
+
+  - title: 🚦 Tests
+    labels:
+      - tests
+
+  - title: 📝 Documentation updates
+    labels:
+      - docs
+
+  - title: ✍ Other changes
+
+  - title: 📦 Dependency updates
+    labels:
+      - dependencies
+    collapse-after: 15
+
+exclude-labels:
+  - reverted
+  - no-changelog
+  - skip-changelog
+  - invalid
+
+change-template: "- $TITLE @$AUTHOR (#$NUMBER)"
+change-title-escapes: '\<*_&'
+
+autolabeler:
+  - label: major
+    title:
+      - "/.+!:/i"
+    body:
+      - "/BREAKING CHANGE/"
+
+  - label: refactor
+    title:
+      - '/refactor(\(.+\))?:/i'
+
+  - label: fix
+    title:
+      - '/fix(\(.+\))?:/i'
+      - '/bugfix(\(.+\))?:/i'
+      - '/bug(\(.+\))?:/i'
+
+  - label: feature
+    title:
+      - '/feat(\(.+\))?:/i'
+      - '/feature(\(.+\))?:/i'
+
+  - label: chore
+    title:
+      - '/chore(\(.+\))?:/i'
+      - '/enhancement(\(.+\))?:/i'
+      - '/style(\(.+\))?:/i'
+
+  - label: tests
+    title:
+      - '/test(\(.+\))?:/i'
+      - '/tests(\(.+\))?:/i'
+      - '/perf(\(.+\))?:/i'
+
+  - label: docs
+    title:
+      - '/doc(\(.+\))?:/i'
+      - '/docs(\(.+\))?:/i'
+
+  - label: cicd
+    title:
+      - '/ci(\(.+\))?:/i'
+      - '/cd(\(.+\))?:/i'
+      - '/cicd(\(.+\))?:/i'
+      - '/build(\(.+\))?:/i'
+
+  - label: deprecation
+    title:
+      - '/deprecated(\(.+\))?:/i'
+      - '/removed(\(.+\))?:/i'
+
+version-resolver:
+  major:
+    labels:
+      - major
+
+  minor:
+    labels:
+      - refactor
+      - fix
+      - feature
+      - cicd
+      - deprecation
+
+  patch:
+    labels:
+      - chore
+      - tests
+      - docs
+
+  default: patch
+
+template: |
+  ## Changes
+
+  $CHANGES
