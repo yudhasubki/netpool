@@ -100,7 +100,7 @@ func New(factory func() (net.Conn, error), cfg Config) (*Netpool, error) {
 			pool.Close()
 			return nil, err
 		}
-		
+
 		pool.idleConns <- idleConn{
 			conn:      conn,
 			idleSince: time.Now(),
@@ -218,7 +218,7 @@ func (p *Netpool) Put(conn net.Conn) {
 		p.numOpen.Add(-1)
 		return
 	}
-	
+
 	select {
 	case p.idleConns <- idleConn{conn: conn, idleSince: time.Now()}:
 	default:
@@ -300,33 +300,39 @@ func (p *Netpool) reapIdle() {
 		return
 	}
 
-	now := time.Now()
-	var toKeep []idleConn
+	n := len(p.idleConns)
+	if n == 0 {
+		return
+	}
 
-	for {
+	now := time.Now()
+
+	for i := 0; i < n; i++ {
 		select {
 		case ic := <-p.idleConns:
 			if now.Sub(ic.idleSince) > p.maxIdleTime {
-				if len(toKeep)+len(p.idleConns) >= int(p.minPool) {
-					ic.conn.Close()
-					p.numOpen.Add(-1)
+				if int(p.numOpen.Load()) <= int(p.minPool) {
+					p.putBack(ic)
 					continue
 				}
+
+				ic.conn.Close()
+				p.numOpen.Add(-1)
+			} else {
+				p.putBack(ic)
 			}
-			toKeep = append(toKeep, ic)
 		default:
-			goto done
+			return
 		}
 	}
+}
 
-done:
-	for _, ic := range toKeep {
-		select {
-		case p.idleConns <- ic:
-		default:
-			ic.conn.Close()
-			p.numOpen.Add(-1)
-		}
+func (p *Netpool) putBack(ic idleConn) {
+	select {
+	case p.idleConns <- ic:
+	default:
+		ic.conn.Close()
+		p.numOpen.Add(-1)
 	}
 }
 
@@ -347,7 +353,7 @@ func (p *Netpool) maintainMin() {
 				p.numOpen.Add(-1)
 				continue
 			}
-			
+
 			select {
 			case p.idleConns <- idleConn{conn: conn, idleSince: time.Now()}:
 			default:
