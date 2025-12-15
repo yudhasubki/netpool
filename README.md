@@ -1,125 +1,152 @@
-# Netpool - Go TCP Connection Pool
+# Netpool - Lock-Free Go TCP Connection Pool
 
-## Description
+[![Go Reference](https://pkg.go.dev/badge/github.com/yudhasubki/netpool.svg)](https://pkg.go.dev/github.com/yudhasubki/netpool)
 
-Netpool is a lightweight and efficient TCP connection pool library for Golang. It provides a simple way to manage and reuse TCP connections, reducing the overhead of establishing new connections for each request and improving performance in high-concurrency scenarios.
+## 🚀 Performance
+
+Netpool is the Go connection pool. It uses a lock-free channel design with zero-allocation pass-by-value optimization.
+
+| Library | ns/op | Throughput | Memory | Allocations | Features |
+|---------|-------|-----------|--------|-------------|----------|
+| **netpool (Basic)** | **42 ns** | **23.8M ops/sec** | **0 B** | **0 allocs** | Maximum Speed (No Idle/Health) |
+| **netpool (Standard)**| **118 ns** | **8.4M ops/sec** | **0 B** | **0 allocs** | IdleTimeout, HealthCheck |
+| fatih/pool | 124 ns | 8.0M ops/sec | 64 B | 1 alloc | No HealthCheck |
+| silenceper/pool | 303 ns | 3.3M ops/sec | 48 B | 1 alloc | IdleTimeout, HealthCheck |
 
 ## Features
-- TCP connection pooling for efficient connection reuse
-- Configurable maximum connection limit per host
-- Automatic connection reaping to remove idle connections
-- Graceful handling of connection errors and reconnecting
-- Customizable connection dialer for flexible connection establishment
-Thread-safe operations for concurrent use
+
+- **Lock-free** - Uses channels and atomics only
+- **Zero allocation** - No memory allocations on Get/Put
+- **Idle Timeout** - Automatically closes stale connections
+- **Health Check** - Validates connections before use
+- **Thread-safe** - Safe for concurrent use
 
 ## Installation
-```
+
+```bash
 go get github.com/yudhasubki/netpool
 ```
 
-## Quick Start	
+## Quick Start
 
-### Basic Usage
+### Standard Pool (Recommended)
+Best balance of features and performance (118 ns/op).
+
 ```go
 package main
 
 import (
     "log"
     "net"
+    "time"
     
     "github.com/yudhasubki/netpool"
 )
 
 func main() {
-    // Create a pool
     pool, err := netpool.New(func() (net.Conn, error) {
-		return net.Dial("tcp", "localhost:6379")
-	},
-		netpool.WithMinPool(5),
-		netpool.WithMaxPool(20),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer pool.Close()
-
-	conn, err := pool.Get()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer conn.Close() // Automatically returns to pool
-
-	conn.Write([]byte("PING\r\n"))
+        return net.Dial("tcp", "localhost:6379")
+    }, netpool.Config{
+        MaxPool:     100,
+        MinPool:     10,
+        MaxIdleTime: 30 * time.Second, // Optional
+        HealthCheck: func(conn net.Conn) error { // Optional
+            return nil
+        },
+    })
+    
+    conn, _ := pool.Get()
+    defer pool.Put(conn)
 }
 ```
 
-### With Idle Timeout
+### Basic Pool (Maximum Performance)
+For use cases needing absolute raw speed (~40 ns/op).
+**Note:** Does NOT support `MaxIdleTime` or `HealthCheck`.
+
 ```go
-pool, err := netpool.New(func() (net.Conn, error) {
+// Use NewBasic() instead of New()
+pool, err := netpool.NewBasic(func() (net.Conn, error) {
     return net.Dial("tcp", "localhost:6379")
-},
-    netpool.WithMinPool(2),
-    netpool.WithMaxPool(10),
-    netpool.WithMaxIdleTime(30*time.Second), 
-)
+}, netpool.Config{
+    MaxPool: 100,
+    MinPool: 10,
+})
+
+conn, _ := pool.Get()
+defer pool.Put(conn)
 ```
 
-### Monitoring Pool Statistics
+## API
+
+### Creating a Pool
+
+```go
+pool, err := netpool.New(factory, netpool.Config{
+    MaxPool:     100,              // Maximum connections
+    MinPool:     10,               // Minimum idle connections
+    DialTimeout: 5 * time.Second,  // Connection creation timeout
+    MaxIdleTime: 30 * time.Second, // Close connections idle too long
+    HealthCheck: pingFunc,         // Validate connection on Get()
+})
+```
+
+### Getting a Connection
+
+```go
+// Simple get (blocks if pool is full)
+conn, err := pool.Get()
+
+// Get with context (supports cancellation/timeout)
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+conn, err := pool.GetWithContext(ctx)
+```
+
+### Returning a Connection
+
+```go
+// Return healthy connection
+pool.Put(conn)
+
+// Return with error (connection will be closed)
+pool.PutWithError(conn, err)
+```
+
+### Pool Statistics
+
 ```go
 stats := pool.Stats()
 fmt.Printf("Active: %d, Idle: %d, InUse: %d\n",
-	stats.Active, stats.Idle, stats.InUse)
+    stats.Active, stats.Idle, stats.InUse)
 ```
 
-## How it works
-### Connection Lifecycle
-- Creation: Connections are created using the provided factory function
-- Dial Hooks: Optional hooks run for connection initialization
-- Pool Storage: Idle connections are stored in a FIFO queue
-- Health Check: Connections are validated before being returned (if configured)
-- Idle Timeout: Unused connections are automatically cleaned up (if configured)
-- Auto-Return: Connections automatically return to pool on Close()
+## How It Works
 
-### Auto-Return Connection Wrapper
-Connections returned by Get() are automatically wrapped in a pooledConn that returns the connection to the pool when Close() is called. This eliminates the need for manual Put() calls:
-```go
-// Old way (manual Put)
-conn, _ := pool.Get()
-defer pool.Put(conn, nil)
+Netpool uses a **Pass-by-Value** channel design for maximum efficiency:
 
-// New way (auto-return)
-conn, _ := pool.Get()
-defer conn.Close() // Automatically returns to pool
+1. **Wait-Free Path**: `Get()` and `Put()` operations use Go channels with value copying.
+2. **Zero Allocation**: Connection wrappers (`idleConn`) are passed by value (copying ~40 bytes), eliminating `sync.Pool` overhead and heap allocations.
+3. **Atomic State**: Pool size is tracked with `atomic.Int32` for contention-free reads.
+
+This design beats standard `sync.Pool` or mutex-based implementations by reducing memory pressure and CPU cycles.
+
+## Running Benchmarks
+
+```bash
+# Run comparison with other libraries
+go test -bench=BenchmarkComparison -benchmem ./...
 ```
 
-If a connection encounters an error and should not be reused, use MarkUnusable():
+## Credits
 
-```go
-conn, _ := pool.Get()
+This project is inspired by the design and implementation of:
 
-_, err := conn.Write(data)
-if err != nil {
-	if pc, ok := conn.(interface{ MarkUnusable() error }); ok {
-		pc.MarkUnusable()
-	}
-	return err
-}
+- [fatih/pool](https://github.com/fatih/pool)
+- [silenceper/pool](https://github.com/silenceper/pool)
 
-conn.Close()
-```
-
-### Thread Safety
-netpool uses fine-grained locking to minimize contention:
-
-Pool operations are protected by a mutex
-Condition variables handle blocking when pool is exhausted
-Connection health checks run without holding the main lock
-
-## Contributing
-Contributions are welcome! If you find a bug or have a suggestion for improvement, please open an issue or submit a pull request. Make sure to follow the existing coding style and write tests for any new functionality.
+We thank the authors for their contributions to the Go ecosystem.
 
 ## License
-This project is licensed under the MIT License. See the LICENSE file for details.
 
-## Acknowledgments
-NetPool is inspired by various connection pool implementations in the Golang ecosystem. We would like to thank the authors of those projects for their contributions and ideas.
+MIT License - see [LICENSE](LICENSE) file.

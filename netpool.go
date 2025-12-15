@@ -1,540 +1,359 @@
 package netpool
 
 import (
-	"container/list"
 	"context"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // Netpooler defines the public interface for a TCP connection pool.
-//
-// It provides methods for acquiring and releasing connections, inspecting
-// pool state, and shutting down the pool. All implementations must be
-// safe for concurrent use.
 type Netpooler interface {
-	// Close shuts down the pool and closes all managed connections.
-	//
-	// After Close is called, all subsequent calls to Get or Put will
-	// return an error. Close is idempotent.
 	Close()
-
-	// Get returns a pooled connection using a background context.
-	//
-	// The returned connection is automatically returned to the pool
-	// when Close() is called on it.
 	Get() (net.Conn, error)
-
-	// GetWithContext returns a pooled connection, blocking until one
-	// becomes available or the context is canceled.
-	//
-	// If the context is canceled while waiting, an error is returned.
 	GetWithContext(ctx context.Context) (net.Conn, error)
-
-	// Len returns the number of currently idle connections in the pool.
 	Len() int
-
-	// Put returns a connection to the pool.
-	//
-	// If err is non-nil, the connection is considered invalid and will
-	// be closed and removed from the pool.
-	//
-	// This method is primarily intended for internal use. Users should
-	// prefer calling Close() on connections returned by Get().
-	Put(conn net.Conn, err error)
-
-	// Stats returns a snapshot of the current pool state.
+	Put(conn net.Conn)
+	PutWithError(conn net.Conn, err error)
 	Stats() PoolStats
 }
 
-// Netpool is a thread-safe TCP connection pool implementation.
-//
-// It manages a set of reusable net.Conn objects, enforcing maximum
-// capacity limits, automatic idle cleanup, and safe concurrent access.
-type Netpool struct {
-	// cond is used to coordinate goroutines waiting for available
-	// connections when the pool is exhausted.
-	cond *sync.Cond
+// Config holds configuration for the connection pool.
+type Config struct {
+	// MaxPool is the maximum number of connections (default: 15)
+	MaxPool int32
 
-	// connections holds idle connections in FIFO order.
-	connections *list.List
+	// MinPool is the minimum idle connections to maintain (default: 0)
+	MinPool int32
 
-	// allConns tracks all active connections currently managed
-	// by the pool, including both idle and in-use connections.
-	allConns map[net.Conn]*connEntry
+	// DialTimeout for connection creation (optional)
+	DialTimeout time.Duration
 
-	// fn is the factory function used to create new connections.
-	fn netpoolFunc
+	// MaxIdleTime is the maximum duration a connection can remain idle.
+	// Connections idle longer than this are closed. Zero disables idle timeout.
+	MaxIdleTime time.Duration
 
-	// mu protects all shared pool state.
-	mu *sync.Mutex
-
-	// config holds the pool configuration parameters.
-	config Config
-
-	// closed indicates whether the pool has been closed.
-	closed atomic.Bool
-
-	// reaper periodically cleans up idle connections.
-	reaper *time.Ticker
-
-	// stopReaper signals background goroutines to exit.
-	stopReaper chan struct{}
-}
-
-// connEntry represents a single connection managed by the pool.
-//
-// It tracks connection state and lifecycle metadata required for
-// safe reuse and idle cleanup.
-type connEntry struct {
-	// conn is the underlying network connection.
-	conn net.Conn
-
-	// lastUsed records the last time this connection was returned
-	// to the idle pool.
-	lastUsed time.Time
-
-	// returned indicates whether the connection is currently
-	// in the idle pool.
-	returned atomic.Bool
+	// HealthCheck is called before returning a connection from Get().
+	// If it returns an error, the connection is discarded and a new one is obtained.
+	// This adds latency but ensures connections are valid.
+	HealthCheck func(conn net.Conn) error
 }
 
 // PoolStats provides a snapshot of the pool's current state.
-//
-// All values represent instantaneous measurements and may change
-// immediately after Stats() returns.
 type PoolStats struct {
-	// Active is the total number of connections currently
-	// managed by the pool (idle + in-use).
-	Active int
-
-	// Idle is the number of currently idle connections
-	// available for immediate use.
-	Idle int
-
-	// InUse is the number of connections currently checked
-	// out by callers.
-	InUse int
-
-	// MaxPool is the configured maximum pool size.
+	Active  int
+	Idle    int
+	InUse   int
 	MaxPool int32
-
-	// MinPool is the configured minimum idle pool size.
 	MinPool int32
 }
 
-type netpoolFunc func() (net.Conn, error)
-
-func New(fn netpoolFunc, opts ...Opt) (*Netpool, error) {
-	config := Config{
-		MaxPool: 15,
-		MinPool: 5,
-	}
-
-	for _, opt := range opts {
-		opt(&config)
-	}
-
-	if config.MinPool < 0 {
-		return nil, ErrInvalidConfig
-	}
-
-	if config.MaxPool < config.MinPool {
-		return nil, ErrInvalidConfig
-	}
-
-	if config.MaxPool == 0 {
-		return nil, ErrInvalidConfig
-	}
-
-	netpool := &Netpool{
-		fn:          fn,
-		mu:          new(sync.Mutex),
-		connections: list.New(),
-		allConns:    make(map[net.Conn]*connEntry),
-		config:      config,
-		stopReaper:  make(chan struct{}),
-	}
-
-	netpool.cond = sync.NewCond(netpool.mu)
-
-	// Create initial MinPool connections
-	for i := int32(0); i < config.MinPool; i++ {
-		conn, err := netpool.createConnection()
-		if err != nil {
-			netpool.Close()
-			return nil, err
-		}
-
-		entry := &connEntry{
-			conn:     conn,
-			lastUsed: time.Now(),
-		}
-		entry.returned.Store(true) // Mark as in pool
-
-		netpool.connections.PushBack(entry)
-		netpool.allConns[conn] = entry
-	}
-
-	// Start idle connection reaper
-	if config.MaxIdleTime > 0 {
-		netpool.startIdleReaper()
-	}
-
-	// Start idle connection maintainer (keeps MinPool alive)
-	if config.MinPool > 0 {
-		netpool.startIdleMaintainer()
-	}
-
-	return netpool, nil
+// idleConn wraps a connection with its idle timestamp.
+// Passed by value to avoid allocations and sync.Pool overhead.
+type idleConn struct {
+	conn      net.Conn
+	idleSince time.Time
 }
 
-func (netpool *Netpool) createConnection() (net.Conn, error) {
-	var conn net.Conn
-	var err error
+// Netpool is a lock-free TCP connection pool using Go channels.
+// No mutex, no map - just channels and atomics for maximum performance.
+type Netpool struct {
+	// idleConns stores idleConn by value to avoid GC overhead
+	idleConns      chan idleConn
+	factory        func() (net.Conn, error)
+	healthCheck    func(conn net.Conn) error
+	numOpen        atomic.Int32
+	maxPool        int32
+	minPool        int32
+	maxIdleTime    time.Duration
+	dialTimeout    time.Duration
+	closed         atomic.Bool
+	stopMaintainer chan struct{}
+}
 
-	// If DialTimeout is set, wrap the dial in a timeout
-	if netpool.config.DialTimeout > 0 {
-		type dialResult struct {
+// New creates a new lock-free connection pool.
+func New(factory func() (net.Conn, error), cfg Config) (*Netpool, error) {
+	if cfg.MaxPool <= 0 {
+		cfg.MaxPool = 15
+	}
+	if cfg.MinPool < 0 {
+		cfg.MinPool = 0
+	}
+	if cfg.MinPool > cfg.MaxPool {
+		cfg.MinPool = cfg.MaxPool
+	}
+
+	pool := &Netpool{
+		idleConns:      make(chan idleConn, cfg.MaxPool),
+		factory:        factory,
+		healthCheck:    cfg.HealthCheck,
+		maxPool:        cfg.MaxPool,
+		minPool:        cfg.MinPool,
+		maxIdleTime:    cfg.MaxIdleTime,
+		dialTimeout:    cfg.DialTimeout,
+		stopMaintainer: make(chan struct{}),
+	}
+
+	for i := int32(0); i < cfg.MinPool; i++ {
+		conn, err := pool.dial()
+		if err != nil {
+			pool.Close()
+			return nil, err
+		}
+		
+		pool.idleConns <- idleConn{
+			conn:      conn,
+			idleSince: time.Now(),
+		}
+		pool.numOpen.Add(1)
+	}
+
+	if cfg.MinPool > 0 || cfg.MaxIdleTime > 0 {
+		go pool.maintainer()
+	}
+
+	return pool, nil
+}
+
+func (p *Netpool) dial() (net.Conn, error) {
+	if p.dialTimeout > 0 {
+		type result struct {
 			conn net.Conn
 			err  error
 		}
-		result := make(chan dialResult, 1)
-
+		ch := make(chan result, 1)
 		go func() {
-			c, e := netpool.fn()
-			result <- dialResult{conn: c, err: e}
+			conn, err := p.factory()
+			ch <- result{conn, err}
 		}()
 
 		select {
-		case r := <-result:
-			conn, err = r.conn, r.err
-		case <-time.After(netpool.config.DialTimeout):
-			// Dial timed out - if dial eventually succeeds, connection will leak
-			// To prevent this, we spawn a cleanup goroutine
-			go func() {
-				if r := <-result; r.conn != nil {
-					r.conn.Close()
-				}
-			}()
+		case r := <-ch:
+			return r.conn, r.err
+		case <-time.After(p.dialTimeout):
 			return nil, ErrDialTimeout
 		}
-	} else {
-		conn, err = netpool.fn()
 	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	if len(netpool.config.DialHooks) > 0 {
-		for _, dialHook := range netpool.config.DialHooks {
-			if err = dialHook(conn); err != nil {
-				conn.Close()
-				return nil, err
-			}
-		}
-	}
-
-	return conn, nil
+	return p.factory()
 }
 
-func (netpool *Netpool) Get() (net.Conn, error) {
-	return netpool.GetWithContext(context.Background())
+// Get returns a connection from the pool.
+func (p *Netpool) Get() (net.Conn, error) {
+	return p.GetWithContext(context.Background())
 }
 
-func (netpool *Netpool) GetWithContext(ctx context.Context) (net.Conn, error) {
-	conn, err := netpool.getWithContext(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	return newPooledConn(conn, netpool), nil
-}
-
-func (netpool *Netpool) getWithContext(ctx context.Context) (net.Conn, error) {
-	if netpool.closed.Load() {
+// GetWithContext returns a connection, blocking until one is available or ctx is cancelled.
+func (p *Netpool) GetWithContext(ctx context.Context) (net.Conn, error) {
+	if p.closed.Load() {
 		return nil, ErrPoolClosed
 	}
 
-	netpool.mu.Lock()
-	defer netpool.mu.Unlock()
+	select {
+	case ic := <-p.idleConns:
+		conn := p.validateConnection(ic)
+		if conn != nil {
+			return conn, nil
+		}
+	default:
+	}
 
 	for {
-		if netpool.closed.Load() {
+		if p.closed.Load() {
 			return nil, ErrPoolClosed
 		}
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 
-		if netpool.connections.Len() > 0 {
-			entry := netpool.connections.Remove(netpool.connections.Front()).(*connEntry)
-			entry.lastUsed = time.Now()
-			entry.returned.Store(false)
-			return entry.conn, nil
-		}
-
-		if len(netpool.allConns) < int(netpool.config.MaxPool) {
-			c, err := netpool.createConnection()
-			if err != nil {
-				return nil, err
+		current := p.numOpen.Load()
+		if current < p.maxPool {
+			if p.numOpen.CompareAndSwap(current, current+1) {
+				conn, err := p.dial()
+				if err != nil {
+					p.numOpen.Add(-1)
+					return nil, err
+				}
+				return conn, nil
 			}
-			entry := &connEntry{
-				conn:     c,
-				lastUsed: time.Now(),
-			}
-			entry.returned.Store(false)
-			netpool.allConns[c] = entry
-			return c, nil
-		}
-
-		// Use context.AfterFunc for cleaner context cancellation handling (Go 1.21+)
-		stop := context.AfterFunc(ctx, func() {
-			netpool.mu.Lock()
-			netpool.cond.Broadcast()
-			netpool.mu.Unlock()
-		})
-
-		netpool.cond.Wait()
-		stop()
-	}
-}
-
-func (netpool *Netpool) Put(conn net.Conn, err error) {
-	if conn == nil {
-		return
-	}
-
-	netpool.mu.Lock()
-	defer netpool.mu.Unlock()
-
-	entry, exists := netpool.allConns[conn]
-	if !exists {
-		_ = conn.Close()
-		return
-	}
-
-	if !entry.returned.CompareAndSwap(false, true) {
-		if err != nil {
-			_ = conn.Close()
-			delete(netpool.allConns, conn)
-			netpool.cond.Signal()
-		}
-		return
-	}
-
-	// Pool closed -> cleanup
-	if netpool.closed.Load() {
-		_ = conn.Close()
-		delete(netpool.allConns, conn)
-		netpool.cond.Broadcast()
-		return
-	}
-
-	// If conn is bad, drop it.
-	if err != nil {
-		_ = conn.Close()
-		delete(netpool.allConns, conn)
-		netpool.cond.Signal()
-		return
-	}
-
-	// If we are above MaxPool (shouldn't happen often, but be safe)
-	if len(netpool.allConns) > int(netpool.config.MaxPool) {
-		_ = conn.Close()
-		delete(netpool.allConns, conn)
-		netpool.cond.Signal()
-		return
-	}
-
-	// Return to pool
-	entry.lastUsed = time.Now()
-	netpool.connections.PushBack(entry)
-	netpool.cond.Signal()
-}
-
-func (netpool *Netpool) Close() {
-	if !netpool.closed.CompareAndSwap(false, true) {
-		return
-	}
-
-	close(netpool.stopReaper)
-
-	netpool.mu.Lock()
-	defer netpool.mu.Unlock()
-
-	if netpool.reaper != nil {
-		netpool.reaper.Stop()
-	}
-
-	for n := netpool.connections.Front(); n != nil; n = n.Next() {
-		entry := n.Value.(*connEntry)
-		entry.conn.Close()
-	}
-	netpool.connections.Init()
-
-	for conn, entry := range netpool.allConns {
-		entry.conn.Close()
-		delete(netpool.allConns, conn)
-	}
-
-	netpool.cond.Broadcast()
-}
-
-func (netpool *Netpool) Stats() PoolStats {
-	netpool.mu.Lock()
-	defer netpool.mu.Unlock()
-
-	idle := netpool.connections.Len()
-	active := len(netpool.allConns)
-
-	return PoolStats{
-		Active:  active,
-		Idle:    idle,
-		InUse:   active - idle,
-		MaxPool: netpool.config.MaxPool,
-		MinPool: netpool.config.MinPool,
-	}
-}
-
-func (netpool *Netpool) Len() int {
-	netpool.mu.Lock()
-	defer netpool.mu.Unlock()
-	return netpool.connections.Len()
-}
-
-func (netpool *Netpool) startIdleReaper() {
-	netpool.reaper = time.NewTicker(netpool.config.MaxIdleTime / 2)
-
-	go func() {
-		for {
-			select {
-			case <-netpool.reaper.C:
-				netpool.reapIdleConnections()
-			case <-netpool.stopReaper:
-				return
-			}
-		}
-	}()
-}
-
-func (netpool *Netpool) startIdleMaintainer() {
-	go func() {
-		interval := netpool.calculateMaintainerInterval()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				netpool.maintainMinPool()
-			case <-netpool.stopReaper:
-				return
-			}
-		}
-	}()
-}
-
-func (netpool *Netpool) calculateMaintainerInterval() time.Duration {
-	if netpool.config.MaintainerInterval > 0 {
-		return netpool.config.MaintainerInterval
-	}
-
-	if netpool.config.MaxIdleTime > 0 && netpool.config.MaxIdleTime < 10*time.Second {
-		return netpool.config.MaxIdleTime
-	}
-
-	if netpool.config.MaxIdleTime > 0 && netpool.config.MaxIdleTime < 1*time.Minute {
-		return 5 * time.Second
-	}
-
-	return 30 * time.Second
-}
-
-// maintainMinPool ensures we always have MinPool idle connections
-func (netpool *Netpool) maintainMinPool() {
-	netpool.mu.Lock()
-	defer netpool.mu.Unlock()
-
-	if netpool.closed.Load() {
-		return
-	}
-
-	idle := netpool.connections.Len()
-	active := len(netpool.allConns)
-
-	// Maintain *idle* minimum = MinPool
-	neededIdle := int(netpool.config.MinPool) - idle
-	if neededIdle <= 0 {
-		return
-	}
-
-	// Cap by remaining capacity to MaxPool
-	remaining := int(netpool.config.MaxPool) - active
-	if remaining <= 0 {
-		return
-	}
-	if neededIdle > remaining {
-		neededIdle = remaining
-	}
-
-	added := 0
-	for i := 0; i < neededIdle; i++ {
-		conn, err := netpool.createConnection()
-		if err != nil {
 			continue
 		}
 
-		entry := &connEntry{
-			conn:     conn,
-			lastUsed: time.Now(),
+		select {
+		case ic := <-p.idleConns:
+			conn := p.validateConnection(ic)
+			if conn != nil {
+				return conn, nil
+			}
+		case <-p.stopMaintainer:
+			return nil, ErrPoolClosed
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		entry.returned.Store(true)
-
-		netpool.connections.PushBack(entry)
-		netpool.allConns[conn] = entry
-		added++
-	}
-
-	if added > 0 {
-		// Wake anyone waiting for a conn
-		netpool.cond.Broadcast()
 	}
 }
 
-// reapIdleConnections removes connections that have been idle too long
-func (netpool *Netpool) reapIdleConnections() {
-	netpool.mu.Lock()
-	defer netpool.mu.Unlock()
+// validateConnection checks if a connection is still valid
+func (p *Netpool) validateConnection(ic idleConn) net.Conn {
+	if p.maxIdleTime > 0 && time.Since(ic.idleSince) > p.maxIdleTime {
+		ic.conn.Close()
+		p.numOpen.Add(-1)
+		return nil
+	}
 
-	if netpool.closed.Load() {
+	if p.healthCheck != nil {
+		if err := p.healthCheck(ic.conn); err != nil {
+			ic.conn.Close()
+			p.numOpen.Add(-1)
+			return nil
+		}
+	}
+
+	return ic.conn
+}
+
+// Put returns a connection to the pool.
+func (p *Netpool) Put(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	if p.closed.Load() {
+		conn.Close()
+		p.numOpen.Add(-1)
+		return
+	}
+	
+	select {
+	case p.idleConns <- idleConn{conn: conn, idleSince: time.Now()}:
+	default:
+		conn.Close()
+		p.numOpen.Add(-1)
+	}
+}
+
+// PutWithError returns a connection, closing it if there was an error.
+func (p *Netpool) PutWithError(conn net.Conn, err error) {
+	if conn == nil {
+		return
+	}
+	if err != nil {
+		conn.Close()
+		p.numOpen.Add(-1)
+		return
+	}
+	p.Put(conn)
+}
+
+// Close closes the pool and all connections.
+func (p *Netpool) Close() {
+	if !p.closed.CompareAndSwap(false, true) {
+		return
+	}
+	close(p.stopMaintainer)
+	for {
+		select {
+		case ic := <-p.idleConns:
+			ic.conn.Close()
+			p.numOpen.Add(-1)
+		default:
+			return
+		}
+	}
+}
+
+// Stats returns pool statistics.
+func (p *Netpool) Stats() PoolStats {
+	idle := len(p.idleConns)
+	total := int(p.numOpen.Load())
+	return PoolStats{
+		Active:  total,
+		Idle:    idle,
+		InUse:   total - idle,
+		MaxPool: p.maxPool,
+		MinPool: p.minPool,
+	}
+}
+
+// Len returns the number of idle connections.
+func (p *Netpool) Len() int {
+	return len(p.idleConns)
+}
+
+func (p *Netpool) maintainer() {
+	interval := 5 * time.Second
+	if p.maxIdleTime > 0 && p.maxIdleTime < interval {
+		interval = p.maxIdleTime / 2
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stopMaintainer:
+			return
+		case <-ticker.C:
+			p.reapIdle()
+			p.maintainMin()
+		}
+	}
+}
+
+// reapIdle removes connections that have been idle too long
+func (p *Netpool) reapIdle() {
+	if p.closed.Load() || p.maxIdleTime == 0 {
 		return
 	}
 
 	now := time.Now()
-	var toRemove []*list.Element
+	var toKeep []idleConn
 
-	for e := netpool.connections.Front(); e != nil; e = e.Next() {
-		entry := e.Value.(*connEntry)
-		if now.Sub(entry.lastUsed) > netpool.config.MaxIdleTime {
-			if netpool.connections.Len()-len(toRemove) <= int(netpool.config.MinPool) {
-				break
+	for {
+		select {
+		case ic := <-p.idleConns:
+			if now.Sub(ic.idleSince) > p.maxIdleTime {
+				if len(toKeep)+len(p.idleConns) >= int(p.minPool) {
+					ic.conn.Close()
+					p.numOpen.Add(-1)
+					continue
+				}
 			}
-			toRemove = append(toRemove, e)
+			toKeep = append(toKeep, ic)
+		default:
+			goto done
 		}
 	}
 
-	for _, e := range toRemove {
-		entry := e.Value.(*connEntry)
-		netpool.connections.Remove(e)
-		entry.conn.Close()
-		delete(netpool.allConns, entry.conn)
+done:
+	for _, ic := range toKeep {
+		select {
+		case p.idleConns <- ic:
+		default:
+			ic.conn.Close()
+			p.numOpen.Add(-1)
+		}
 	}
+}
 
-	if len(toRemove) > 0 {
-		netpool.cond.Broadcast()
+func (p *Netpool) maintainMin() {
+	if p.closed.Load() {
+		return
+	}
+	idle := len(p.idleConns)
+	needed := int(p.minPool) - idle
+	for i := 0; i < needed; i++ {
+		current := p.numOpen.Load()
+		if current >= p.maxPool {
+			break
+		}
+		if p.numOpen.CompareAndSwap(current, current+1) {
+			conn, err := p.dial()
+			if err != nil {
+				p.numOpen.Add(-1)
+				continue
+			}
+			
+			select {
+			case p.idleConns <- idleConn{conn: conn, idleSince: time.Now()}:
+			default:
+				conn.Close()
+				p.numOpen.Add(-1)
+			}
+		}
 	}
 }
