@@ -10,7 +10,8 @@ import (
 // BasicPool is a stripped-down lock-free pool without IdleTimeout or HealthCheck.
 type BasicPool struct {
 	idleConns      chan net.Conn
-	factory        func() (net.Conn, error)
+	sem            chan struct{}
+	factory        func(context.Context) (net.Conn, error)
 	numOpen        atomic.Int32
 	maxPool        int32
 	minPool        int32
@@ -21,7 +22,7 @@ type BasicPool struct {
 
 // NewBasic creates a new high-performance basic pool.
 // Note: This pool ignores MaxIdleTime and HealthCheck in Config.
-func NewBasic(factory func() (net.Conn, error), cfg Config) (*BasicPool, error) {
+func NewBasic(factory func(context.Context) (net.Conn, error), cfg Config) (*BasicPool, error) {
 	if cfg.MaxPool <= 0 {
 		cfg.MaxPool = 15
 	}
@@ -34,6 +35,7 @@ func NewBasic(factory func() (net.Conn, error), cfg Config) (*BasicPool, error) 
 
 	pool := &BasicPool{
 		idleConns:      make(chan net.Conn, cfg.MaxPool),
+		sem:            make(chan struct{}, cfg.MaxPool),
 		factory:        factory,
 		maxPool:        cfg.MaxPool,
 		minPool:        cfg.MinPool,
@@ -41,14 +43,24 @@ func NewBasic(factory func() (net.Conn, error), cfg Config) (*BasicPool, error) 
 		stopMaintainer: make(chan struct{}),
 	}
 
+	// Initialize semaphore
+	for i := int32(0); i < cfg.MaxPool; i++ {
+		pool.sem <- struct{}{}
+	}
+
 	for i := int32(0); i < cfg.MinPool; i++ {
-		conn, err := pool.dial()
-		if err != nil {
-			pool.Close()
-			return nil, err
+		select {
+		case <-pool.sem:
+			conn, err := pool.dial(context.Background())
+			if err != nil {
+				pool.sem <- struct{}{}
+				pool.Close()
+				return nil, err
+			}
+			pool.idleConns <- conn
+			pool.numOpen.Add(1)
+		default:
 		}
-		pool.idleConns <- conn
-		pool.numOpen.Add(1)
 	}
 
 	if cfg.MinPool > 0 {
@@ -58,26 +70,13 @@ func NewBasic(factory func() (net.Conn, error), cfg Config) (*BasicPool, error) 
 	return pool, nil
 }
 
-func (p *BasicPool) dial() (net.Conn, error) {
+func (p *BasicPool) dial(ctx context.Context) (net.Conn, error) {
 	if p.dialTimeout > 0 {
-		type result struct {
-			conn net.Conn
-			err  error
-		}
-		ch := make(chan result, 1)
-		go func() {
-			conn, err := p.factory()
-			ch <- result{conn, err}
-		}()
-
-		select {
-		case r := <-ch:
-			return r.conn, r.err
-		case <-time.After(p.dialTimeout):
-			return nil, ErrDialTimeout
-		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.dialTimeout)
+		defer cancel()
 	}
-	return p.factory()
+	return p.factory(ctx)
 }
 
 // Get returns a connection from the pool.
@@ -91,38 +90,28 @@ func (p *BasicPool) GetWithContext(ctx context.Context) (net.Conn, error) {
 		return nil, ErrPoolClosed
 	}
 
+	// Fast path
 	select {
 	case conn := <-p.idleConns:
 		return conn, nil
 	default:
 	}
 
-	for {
-		if p.closed.Load() {
-			return nil, ErrPoolClosed
+	select {
+	case conn := <-p.idleConns:
+		return conn, nil
+	case <-p.sem:
+		conn, err := p.dial(ctx)
+		if err != nil {
+			p.sem <- struct{}{}
+			return nil, err
 		}
-
-		current := p.numOpen.Load()
-		if current < p.maxPool {
-			if p.numOpen.CompareAndSwap(current, current+1) {
-				conn, err := p.dial()
-				if err != nil {
-					p.numOpen.Add(-1)
-					return nil, err
-				}
-				return conn, nil
-			}
-			continue
-		}
-
-		select {
-		case conn := <-p.idleConns:
-			return conn, nil
-		case <-p.stopMaintainer:
-			return nil, ErrPoolClosed
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+		p.numOpen.Add(1)
+		return conn, nil
+	case <-p.stopMaintainer:
+		return nil, ErrPoolClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -136,12 +125,13 @@ func (p *BasicPool) Put(conn net.Conn) {
 		p.numOpen.Add(-1)
 		return
 	}
-	
+
 	select {
 	case p.idleConns <- conn:
 	default:
 		conn.Close()
 		p.numOpen.Add(-1)
+		p.sem <- struct{}{}
 	}
 }
 
@@ -153,6 +143,10 @@ func (p *BasicPool) PutWithError(conn net.Conn, err error) {
 	if err != nil {
 		conn.Close()
 		p.numOpen.Add(-1)
+		select {
+		case p.sem <- struct{}{}:
+		default:
+		}
 		return
 	}
 	p.Put(conn)
@@ -213,22 +207,22 @@ func (p *BasicPool) maintainMin() {
 	idle := len(p.idleConns)
 	needed := int(p.minPool) - idle
 	for i := 0; i < needed; i++ {
-		current := p.numOpen.Load()
-		if current >= p.maxPool {
-			break
-		}
-		if p.numOpen.CompareAndSwap(current, current+1) {
-			conn, err := p.dial()
+		select {
+		case <-p.sem:
+			conn, err := p.dial(context.Background())
 			if err != nil {
-				p.numOpen.Add(-1)
+				p.sem <- struct{}{}
 				continue
 			}
 			select {
 			case p.idleConns <- conn:
+				p.numOpen.Add(1)
 			default:
 				conn.Close()
-				p.numOpen.Add(-1)
+				p.sem <- struct{}{}
 			}
+		default:
+			return
 		}
 	}
 }

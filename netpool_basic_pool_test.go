@@ -13,8 +13,9 @@ func TestNewBasic(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := NewBasic(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := NewBasic(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 10,
 		MinPool: 2,
@@ -37,8 +38,9 @@ func TestBasicGetPut(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := NewBasic(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := NewBasic(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 5,
 		MinPool: 0,
@@ -75,8 +77,9 @@ func TestBasicConcurrent(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := NewBasic(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := NewBasic(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 100,
 		MinPool: 0,
@@ -112,8 +115,9 @@ func TestBasicPoolClose(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, _ := NewBasic(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := NewBasic(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 5,
 		MinPool: 2,
@@ -131,8 +135,9 @@ func TestBasicPutWithError(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, _ := NewBasic(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := NewBasic(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 5,
 	})
@@ -151,8 +156,9 @@ func TestBasicContextCancellation(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, _ := NewBasic(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := NewBasic(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 1,
 	})
@@ -175,8 +181,9 @@ func TestBasicRace(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, _ := NewBasic(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := NewBasic(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 10,
 	})

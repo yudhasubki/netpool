@@ -44,16 +44,17 @@ import (
 )
 
 func main() {
-    pool, err := netpool.New(func() (net.Conn, error) {
-        return net.Dial("tcp", "localhost:6379")
-    }, netpool.Config{
-        MaxPool:     100,
-        MinPool:     10,
-        MaxIdleTime: 30 * time.Second, // Optional
-        HealthCheck: func(conn net.Conn) error { // Optional
-            return nil
-        },
-    })
+	// Create a new pool
+	// Factory function now accepts context for proper timeout/cancellation!
+	pool, err := netpool.New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", "127.0.0.1:8080")
+	}, netpool.Config{
+		MaxPool:     100,
+		MinPool:     10,
+		MaxIdleTime: 30 * time.Second,
+		DialTimeout: 5 * time.Second, 
+	})
     
     conn, _ := pool.Get()
     defer pool.Put(conn)

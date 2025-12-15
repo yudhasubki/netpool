@@ -42,8 +42,9 @@ func TestNewPool(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 10,
 		MinPool: 2,
@@ -63,8 +64,9 @@ func TestGetPut(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 5,
 		MinPool: 0,
@@ -101,8 +103,9 @@ func TestConcurrentAccess(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 10,
 		MinPool: 0,
@@ -138,8 +141,9 @@ func TestMaxPoolLimit(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 3,
 		MinPool: 0,
@@ -183,8 +187,9 @@ func TestPoolClose(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 5,
 		MinPool: 2,
@@ -206,8 +211,9 @@ func TestPutWithError(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, err := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, err := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 5,
 		MinPool: 0,
@@ -230,7 +236,7 @@ func TestPutWithError(t *testing.T) {
 
 func TestDialFailure(t *testing.T) {
 	callCount := 0
-	_, err := New(func() (net.Conn, error) {
+	_, err := New(func(ctx context.Context) (net.Conn, error) {
 		callCount++
 		return nil, net.UnknownNetworkError("test error")
 	}, Config{
@@ -247,8 +253,9 @@ func TestContextCancellation(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, _ := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 1,
 		MinPool: 0,
@@ -272,8 +279,9 @@ func TestContextCancellation(t *testing.T) {
 
 func TestDialTimeout(t *testing.T) {
 	// Use a non-routable IP to simulate timeout
-	pool, err := New(func() (net.Conn, error) {
-		return net.Dial("tcp", "10.255.255.1:12345")
+	pool, err := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", "10.255.255.1:12345")
 	}, Config{
 		MaxPool:     5,
 		MinPool:     0,
@@ -285,7 +293,7 @@ func TestDialTimeout(t *testing.T) {
 	defer pool.Close()
 
 	_, err = pool.Get()
-	if err != ErrDialTimeout {
+	if err.Error() != "dial tcp 10.255.255.1:12345: i/o timeout" {
 		t.Errorf("expected ErrDialTimeout, got %v", err)
 	}
 }
@@ -296,8 +304,9 @@ func BenchmarkPoolGet(b *testing.B) {
 	listener, addr := createTestServer(b)
 	defer listener.Close()
 
-	pool, _ := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 100,
 		MinPool: 50,
@@ -320,8 +329,9 @@ func BenchmarkPoolConcurrent(b *testing.B) {
 	listener, addr := createTestServer(b)
 	defer listener.Close()
 
-	pool, _ := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 300,
 		MinPool: 10,
@@ -345,8 +355,9 @@ func BenchmarkPoolGetNoContention(b *testing.B) {
 	listener, addr := createTestServer(b)
 	defer listener.Close()
 
-	pool, _ := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 1000,
 		MinPool: 100,
@@ -372,8 +383,9 @@ func TestRaceGetPut(t *testing.T) {
 	listener, addr := createTestServer(t)
 	defer listener.Close()
 
-	pool, _ := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 10,
 		MinPool: 0,

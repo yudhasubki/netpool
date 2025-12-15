@@ -1,6 +1,7 @@
 package netpool
 
 import (
+	"context"
 	"net"
 	"testing"
 
@@ -12,8 +13,9 @@ func BenchmarkComparisonNetpool(b *testing.B) {
 	listener, addr := createTestServer(b)
 	defer listener.Close()
 
-	pool, _ := New(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := New(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 100,
 		MinPool: 50,
@@ -63,9 +65,9 @@ func BenchmarkComparisonSilencerPool(b *testing.B) {
 	defer listener.Close()
 
 	poolConfig := &silencerpool.Config{
-		InitialCap:  10,
-		MaxIdle:     50,
-		MaxCap:      100,
+		InitialCap: 10,
+		MaxIdle:    50,
+		MaxCap:     100,
 		Factory: func() (interface{}, error) {
 			return net.Dial("tcp", addr)
 		},
@@ -96,8 +98,9 @@ func BenchmarkComparisonBasicPool(b *testing.B) {
 	listener, addr := createTestServer(b)
 	defer listener.Close()
 
-	pool, _ := NewBasic(func() (net.Conn, error) {
-		return net.Dial("tcp", addr)
+	pool, _ := NewBasic(func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
 	}, Config{
 		MaxPool: 100,
 		MinPool: 50,
